@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build / dist
+dist/
+build/
+*.app
+*.dmg
+
+# Secrets / env
+.env
+.env.local
+
+# Logs
+*.log
