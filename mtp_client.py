@@ -629,6 +629,8 @@ class MTPDevice:
         """
         tmp_path = dest_path + '.part'
         with self._lock:
+            if self.dev is None:
+                raise MTPError("Phone not connected")
             try:
                 self._get_object_streaming(handle, tmp_path, progress_cb, cancel_cb)
             except MTPCancelled:
@@ -730,6 +732,8 @@ class MTPDevice:
           2. SendObject      command  → data (file bytes)        → response
         """
         with self._lock:
+            if self.dev is None:
+                raise MTPError("Phone not connected")
             if cancel_cb is not None and cancel_cb():
                 raise MTPCancelled("Upload cancelled")
             if storage_id is None:

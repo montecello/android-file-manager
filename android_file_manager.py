@@ -10,6 +10,8 @@ import os
 import shutil
 import logging
 import tempfile
+import threading
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -19,9 +21,20 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QTreeWidget, QTreeWidgetItem,
     QMessageBox, QProgressDialog, QHeaderView, QMenu,
     QSplitter, QFrame, QStatusBar, QInputDialog, QLineEdit,
+    QDialog, QListWidget, QListWidgetItem, QStackedWidget, QSlider,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QColor, QPalette, QAction
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
+from PyQt6.QtGui import (
+    QFont, QColor, QPalette, QAction, QIcon, QImage, QImageReader,
+    QPainter, QPixmap, QDesktopServices,
+)
+
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PyQt6.QtMultimediaWidgets import QVideoWidget
+    MULTIMEDIA_AVAILABLE = True
+except ImportError:
+    MULTIMEDIA_AVAILABLE = False
 
 from mtp_client import MTPDevice, HANDLE_ROOT, MTPCancelled, is_disconnect_error
 
@@ -45,6 +58,39 @@ def safe_filename(name: str) -> str:
     if name in ('', '.', '..'):
         return '_'
     return name
+
+
+# Media extensions recognised by the preview gallery
+IMAGE_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp',
+    '.heic', '.heif', '.tif', '.tiff',
+}
+VIDEO_EXTENSIONS = {
+    '.mp4', '.m4v', '.mov', '.avi', '.3gp', '.3g2',
+    '.mkv', '.webm', '.mpg', '.mpeg', '.wmv', '.mts',
+}
+
+
+def media_kind(name: str):
+    """Return 'image', 'video', or None based on the file extension."""
+    ext = os.path.splitext(name or '')[1].lower()
+    if ext in IMAGE_EXTENSIONS:
+        return 'image'
+    if ext in VIDEO_EXTENSIONS:
+        return 'video'
+    return None
+
+
+_preview_cache_dir = None
+
+
+def preview_cache_dir() -> str:
+    """Session-scoped temp cache for phone files downloaded for previewing.
+    Removed when the main window closes."""
+    global _preview_cache_dir
+    if _preview_cache_dir is None:
+        _preview_cache_dir = tempfile.mkdtemp(prefix='mtp_preview_')
+    return _preview_cache_dir
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +344,421 @@ class TransferWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# Gallery: background media loader
+# ---------------------------------------------------------------------------
+class GalleryLoadWorker(QThread):
+    """
+    Prepares gallery media off the GUI thread.
+
+    Image rows are queued up front: download from the phone if needed, then
+    decode a thumbnail. Video rows are fetched only on demand (prioritize())
+    so one big movie never stalls the photo thumbnails.
+    """
+    THUMB_PX = 320   # decode size; painted at half that, stays crisp on retina
+
+    path_ready = pyqtSignal(int, str)            # row, local file path
+    thumb_ready = pyqtSignal(int, QImage)        # row, decoded thumbnail
+    row_failed = pyqtSignal(int, str)            # row, error message
+    fetch_progress = pyqtSignal(int, int, int)   # row, bytes done, bytes total
+
+    def __init__(self, items: list, is_phone: bool):
+        super().__init__()
+        self.items = items
+        self.is_phone = is_phone
+        self._lock = threading.Lock()
+        self._queue = deque(i for i, it in enumerate(items)
+                            if it['kind'] == 'image')
+        self._queued = set(self._queue)
+        self._done = set()
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def prioritize(self, row: int):
+        """Move a row to the front of the work queue (adding it if absent)."""
+        with self._lock:
+            if row in self._done:
+                return
+            if row in self._queued:
+                self._queue.remove(row)
+            self._queue.appendleft(row)
+            self._queued.add(row)
+
+    def _next_row(self):
+        with self._lock:
+            if self._queue:
+                row = self._queue.popleft()
+                self._queued.discard(row)
+                return row
+        return None
+
+    def run(self):
+        while not self._stop:
+            row = self._next_row()
+            if row is None:
+                self.msleep(80)   # idle — wait for on-demand video requests
+                continue
+            try:
+                self._process(row)
+            except MTPCancelled:
+                break
+            except Exception as e:
+                self.row_failed.emit(row, str(e))
+                if is_disconnect_error(e):
+                    break   # every further download would fail the same way
+            finally:
+                with self._lock:
+                    self._done.add(row)
+
+    def _process(self, row: int):
+        item = self.items[row]
+        path = item['path'] if not self.is_phone \
+            else self._fetch_from_phone(row, item)
+        if self._stop:
+            return
+        self.path_ready.emit(row, path)
+        if item['kind'] == 'image':
+            img = self._load_thumb(path)
+            if img is not None and not self._stop:
+                self.thumb_ready.emit(row, img)
+
+    def _fetch_from_phone(self, row: int, item: dict) -> str:
+        name = f"{item['handle']:08x}_{item.get('size', 0)}_{safe_filename(item['name'])}"
+        path = os.path.join(preview_cache_dir(), name)
+        if not os.path.exists(path):
+            mtp.get_object(
+                item['handle'], path,
+                progress_cb=lambda d, t, r=row: self.fetch_progress.emit(r, d, t),
+                cancel_cb=lambda: self._stop)
+        return path
+
+    def _load_thumb(self, path: str):
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)   # honour EXIF rotation
+        size = reader.size()
+        if size.isValid() and size.width() > 0 and size.height() > 0:
+            reader.setScaledSize(size.scaled(
+                self.THUMB_PX, self.THUMB_PX,
+                Qt.AspectRatioMode.KeepAspectRatio))
+        img = reader.read()
+        return None if img.isNull() else img
+
+
+# ---------------------------------------------------------------------------
+# Gallery: thumbnail grid + full-size viewer
+# ---------------------------------------------------------------------------
+class GalleryDialog(QDialog):
+    """Preview gallery for the images/videos of one folder.
+
+    Grid of thumbnails; double-click (or Enter) opens the full-size viewer
+    with Prev/Next + arrow-key navigation. Videos play in-app when Qt
+    Multimedia is available, otherwise in the default external app.
+    """
+    THUMB = 160
+
+    def __init__(self, parent, title: str, items: list, is_phone: bool,
+                 start_index: int = None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(920, 660)
+        self.setSizeGripEnabled(True)
+        self.items = items
+        self.is_phone = is_phone
+        # Mac files are already local; phone files get a path once fetched
+        self._paths = [None if is_phone else it.get('path') for it in items]
+        self._errors = [None] * len(items)
+        self._current = -1
+        self._full_pixmap = None
+        self._player = None
+        self._audio = None
+        self._video_widget = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        self.pages = QStackedWidget()
+        root.addWidget(self.pages)
+
+        # ── Grid page ──
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListWidget.ViewMode.IconMode)
+        self.grid.setIconSize(QSize(self.THUMB, self.THUMB))
+        self.grid.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.grid.setMovement(QListWidget.Movement.Static)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setSpacing(10)
+        self.grid.setWordWrap(True)
+        for it in items:
+            glyph = "🎬" if it['kind'] == 'video' else "🖼"
+            li = QListWidgetItem(self._glyph_icon(glyph), it['name'])
+            li.setSizeHint(QSize(self.THUMB + 24, self.THUMB + 44))
+            self.grid.addItem(li)
+        self.grid.itemDoubleClicked.connect(self._open_item)
+        self.grid.itemActivated.connect(self._open_item)
+        self.pages.addWidget(self.grid)
+
+        # ── Viewer page ──
+        viewer = QWidget()
+        vl = QVBoxLayout(viewer)
+        vl.setContentsMargins(0, 0, 0, 0)
+
+        top = QHBoxLayout()
+        top.addWidget(self._btn("⬅  Grid", self._back_to_grid))
+        top.addStretch()
+        self.name_lbl = QLabel("")
+        self.name_lbl.setStyleSheet("font-weight: bold;")
+        top.addWidget(self.name_lbl)
+        top.addStretch()
+        self.open_ext_btn = self._btn("↗  Open in app", self._open_external)
+        top.addWidget(self.open_ext_btn)
+        vl.addLayout(top)
+
+        self.center = QStackedWidget()
+        self.img_label = QLabel()
+        self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.img_label.setMinimumSize(1, 1)   # allow shrinking with the window
+        self.center.addWidget(self.img_label)
+        self.info_label = QLabel("")
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.info_label.setStyleSheet("color: #666; font-size: 14px;")
+        self.center.addWidget(self.info_label)
+        vl.addWidget(self.center, 1)
+
+        # Video transport controls (hidden while viewing images)
+        self.video_bar = QWidget()
+        vb = QHBoxLayout(self.video_bar)
+        vb.setContentsMargins(0, 0, 0, 0)
+        self.play_btn = self._btn("⏸ Pause", self._toggle_play)
+        vb.addWidget(self.play_btn)
+        self.seek = QSlider(Qt.Orientation.Horizontal)
+        self.seek.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        vb.addWidget(self.seek, 1)
+        self.time_lbl = QLabel("0:00 / 0:00")
+        vb.addWidget(self.time_lbl)
+        vl.addWidget(self.video_bar)
+        self.video_bar.hide()
+
+        nav = QHBoxLayout()
+        nav.addStretch()
+        nav.addWidget(self._btn("◀  Prev", lambda: self._show_row(self._current - 1)))
+        self.pos_lbl = QLabel("")
+        self.pos_lbl.setStyleSheet("padding: 0 12px;")
+        nav.addWidget(self.pos_lbl)
+        nav.addWidget(self._btn("Next  ▶", lambda: self._show_row(self._current + 1)))
+        nav.addStretch()
+        vl.addLayout(nav)
+
+        self.viewer_page = viewer
+        self.pages.addWidget(viewer)
+
+        # ── Background loader ──
+        self.worker = GalleryLoadWorker(items, is_phone)
+        self.worker.path_ready.connect(self._on_path_ready)
+        self.worker.thumb_ready.connect(self._on_thumb_ready)
+        self.worker.row_failed.connect(self._on_row_failed)
+        self.worker.fetch_progress.connect(self._on_fetch_progress)
+        self.worker.start()
+
+        if start_index is not None:
+            self._show_row(start_index)
+
+    # -- small helpers --------------------------------------------------
+    def _btn(self, text: str, slot) -> QPushButton:
+        b = QPushButton(text)
+        b.setAutoDefault(False)
+        b.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # keep arrow keys for nav
+        b.clicked.connect(slot)
+        return b
+
+    def _glyph_icon(self, glyph: str) -> QIcon:
+        pm = QPixmap(self.THUMB, self.THUMB)
+        pm.fill(QColor(234, 236, 241))
+        p = QPainter(pm)
+        f = QFont()
+        f.setPointSize(46)
+        p.setFont(f)
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, glyph)
+        p.end()
+        return QIcon(pm)
+
+    def _show_info(self, text: str):
+        self.info_label.setText(text)
+        self.center.setCurrentWidget(self.info_label)
+
+    # -- navigation -----------------------------------------------------
+    def _open_item(self, li: QListWidgetItem):
+        self._show_row(self.grid.row(li))
+
+    def _show_row(self, row: int):
+        if not (0 <= row < len(self.items)):
+            return
+        if row == self._current and self.pages.currentWidget() is self.viewer_page:
+            return   # itemActivated + itemDoubleClicked can both fire
+        self._current = row
+        self._stop_playback()
+        self.pages.setCurrentWidget(self.viewer_page)
+        self.grid.setCurrentRow(row)
+        it = self.items[row]
+        self.name_lbl.setText(it['name'])
+        self.pos_lbl.setText(f"{row + 1} / {len(self.items)}")
+        self.video_bar.hide()
+        self.open_ext_btn.setEnabled(self._paths[row] is not None)
+        if self._errors[row]:
+            self._show_info(f"⚠  {self._errors[row]}")
+            return
+        if self._paths[row] is None:
+            self.worker.prioritize(row)
+            self._show_info("Downloading from phone…")
+            return
+        self._display(row)
+
+    def _back_to_grid(self):
+        self._stop_playback()
+        self.video_bar.hide()
+        self.pages.setCurrentWidget(self.grid)
+
+    # -- display --------------------------------------------------------
+    def _display(self, row: int):
+        path = self._paths[row]
+        self.open_ext_btn.setEnabled(True)
+        if self.items[row]['kind'] == 'image':
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            img = reader.read()
+            if img.isNull():
+                self._show_info("Could not decode this image —\ntry '↗ Open in app'")
+                return
+            self._full_pixmap = QPixmap.fromImage(img)
+            self.center.setCurrentWidget(self.img_label)
+            self._refit()
+        else:
+            self._play_video(path)
+
+    def _refit(self):
+        if self._full_pixmap is None or self._full_pixmap.isNull():
+            return
+        if self.center.currentWidget() is not self.img_label:
+            return
+        self.img_label.setPixmap(self._full_pixmap.scaled(
+            self.img_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+
+    # -- video ----------------------------------------------------------
+    def _ensure_player(self) -> bool:
+        if self._player is not None:
+            return True
+        if not MULTIMEDIA_AVAILABLE:
+            return False
+        self._video_widget = QVideoWidget()
+        self.center.addWidget(self._video_widget)
+        self._audio = QAudioOutput(self)
+        self._player = QMediaPlayer(self)
+        self._player.setAudioOutput(self._audio)
+        self._player.setVideoOutput(self._video_widget)
+        self._player.positionChanged.connect(self._on_position)
+        self._player.durationChanged.connect(self._on_duration)
+        self.seek.sliderMoved.connect(self._player.setPosition)
+        return True
+
+    def _play_video(self, path: str):
+        if not self._ensure_player():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            self._show_info("Qt Multimedia not available —\nopened in the default app instead")
+            return
+        self.center.setCurrentWidget(self._video_widget)
+        self.video_bar.show()
+        self._player.setSource(QUrl.fromLocalFile(path))
+        self._player.play()
+        self.play_btn.setText("⏸ Pause")
+
+    def _toggle_play(self):
+        if self._player is None:
+            return
+        if self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self._player.pause()
+            self.play_btn.setText("▶ Play")
+        else:
+            self._player.play()
+            self.play_btn.setText("⏸ Pause")
+
+    def _stop_playback(self):
+        if self._player is not None:
+            self._player.stop()
+
+    @staticmethod
+    def _fmt_ms(ms: int) -> str:
+        s = max(0, ms) // 1000
+        return f"{s // 60}:{s % 60:02d}"
+
+    def _on_position(self, pos: int):
+        if not self.seek.isSliderDown():
+            self.seek.setValue(pos)
+        self.time_lbl.setText(
+            f"{self._fmt_ms(pos)} / {self._fmt_ms(self._player.duration())}")
+
+    def _on_duration(self, dur: int):
+        self.seek.setRange(0, dur)
+
+    def _open_external(self):
+        if 0 <= self._current < len(self._paths) and self._paths[self._current]:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self._paths[self._current]))
+
+    # -- loader signals -------------------------------------------------
+    def _on_path_ready(self, row: int, path: str):
+        self._paths[row] = path
+        if row == self._current and self.pages.currentWidget() is self.viewer_page:
+            self._display(row)
+
+    def _on_thumb_ready(self, row: int, img: QImage):
+        li = self.grid.item(row)
+        if li is not None:
+            li.setIcon(QIcon(QPixmap.fromImage(img)))
+
+    def _on_row_failed(self, row: int, msg: str):
+        self._errors[row] = msg
+        li = self.grid.item(row)
+        if li is not None:
+            li.setIcon(self._glyph_icon("⚠"))
+        if row == self._current:
+            self._show_info(f"⚠  {msg}")
+
+    def _on_fetch_progress(self, row: int, done: int, total: int):
+        if row == self._current and total > 0 and self._paths[row] is None:
+            self._show_info(f"Downloading from phone…  {min(done * 100 // total, 100)}%")
+
+    # -- events / cleanup -----------------------------------------------
+    def keyPressEvent(self, event):
+        if self.pages.currentWidget() is self.viewer_page:
+            k = event.key()
+            if k in (Qt.Key.Key_Left, Qt.Key.Key_Up):
+                self._show_row(self._current - 1)
+                return
+            if k in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+                self._show_row(self._current + 1)
+                return
+            if k == Qt.Key.Key_Space:
+                self._toggle_play()
+                return
+            if k == Qt.Key.Key_Escape:
+                self._back_to_grid()
+                return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._refit()
+
+    def done(self, result: int):
+        self._stop_playback()
+        if self._player is not None:
+            self._player.setSource(QUrl())
+        self.worker.stop()
+        self.worker.wait(3000)
+        super().done(result)
+
+
+# ---------------------------------------------------------------------------
 # File Pane
 # ---------------------------------------------------------------------------
 class FilePane(QWidget):
@@ -418,6 +879,12 @@ class FilePane(QWidget):
         self.search.setStyleSheet("font-size: 11px; padding: 2px 4px;")
         self.search.textChanged.connect(self._apply_filter)
         path_row.addWidget(self.search)
+
+        gallery_b = QPushButton("🖼")
+        gallery_b.setFixedWidth(32)
+        gallery_b.setToolTip("Preview images && videos in this folder")
+        gallery_b.clicked.connect(lambda: self._open_gallery())
+        path_row.addWidget(gallery_b)
 
         refresh_b = QPushButton("↺")
         refresh_b.setFixedWidth(32)
@@ -761,6 +1228,41 @@ class FilePane(QWidget):
             self.footer.setText(f"{shown} match{'es' if shown != 1 else ''} for “{text}”")
 
     # ------------------------------------------------------------------
+    # Preview gallery
+    # ------------------------------------------------------------------
+    def _media_items(self) -> list:
+        """Visible (unfiltered-out) images/videos of the current listing."""
+        items = []
+        for i in range(self.tree.topLevelItemCount()):
+            it = self.tree.topLevelItem(i)
+            if it.isHidden():
+                continue
+            data = it.data(0, Qt.ItemDataRole.UserRole)
+            if not data or data.get('is_dir') or data.get('is_storage'):
+                continue
+            kind = media_kind(data.get('name', ''))
+            if kind:
+                items.append({**data, 'kind': kind})
+        return items
+
+    def _open_gallery(self, start_name: str = None):
+        if self.is_phone and not mtp.is_connected():
+            self.footer.setText("Phone not connected — click 'Connect Phone'")
+            return
+        items = self._media_items()
+        if not items:
+            self.footer.setText("No images or videos in this folder")
+            return
+        start = None
+        if start_name is not None:
+            start = next((i for i, it in enumerate(items)
+                          if it['name'] == start_name), None)
+        where = "Phone" if self.is_phone else "Mac"
+        dlg = GalleryDialog(self, f"Gallery — {where} ({len(items)} media files)",
+                            items, self.is_phone, start_index=start)
+        dlg.exec()
+
+    # ------------------------------------------------------------------
     # Selection
     # ------------------------------------------------------------------
     def selected_items(self) -> list:
@@ -817,7 +1319,12 @@ class FilePane(QWidget):
     # ------------------------------------------------------------------
     def _on_double_click(self, item, _col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
-        if not data or not data['is_dir']:
+        if not data:
+            return
+        if not data['is_dir']:
+            # Double-clicking an image/video opens the gallery viewer on it
+            if media_kind(data.get('name', '')):
+                self._open_gallery(start_name=data['name'])
             return
         if self.is_phone:
             if data.get('is_storage'):
@@ -1426,6 +1933,11 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.critical(self, "Transfer Error", msg)
         refresh_pane.refresh()
+
+    def closeEvent(self, event):
+        if _preview_cache_dir is not None:
+            shutil.rmtree(_preview_cache_dir, ignore_errors=True)
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------

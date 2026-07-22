@@ -19,6 +19,7 @@ cd /Users/powerfan/Desktop/Android
 - Navigate both MTP storages (internal + SD card)
 - Upload and download files (streaming, handles large files)
 - Rename, delete, new folder, cut/paste move on the phone
+- Preview gallery for photos & videos on both panes (🖼 button, or double-click a media file) — thumbnails, arrow-key browsing, in-app video playback
 - Create M3U playlists from a phone folder
 - External USB drive shortcuts (💽 Volumes)
 - Auto disconnect/reconnect detection (no restart needed)
@@ -70,8 +71,9 @@ python3 -m venv .venv
 4. **Navigate** by double-clicking folders
 5. **Select files** with click (⌘-click for multi-select, ⇧-click for range)
 6. **Transfer files** using the → Phone / ← Mac buttons, or drag files from Finder onto the phone pane
-7. **Create folders** via right-click → New Folder
-8. **Rename / delete** via right-click context menu
+7. **Preview media** — click 🖼 (or double-click an image/video) to open the gallery; ← → keys navigate, Space plays/pauses video, Esc returns to the grid. Phone files download to a temporary cache (cleared when the app closes); videos are only fetched when you open them.
+8. **Create folders** via right-click → New Folder
+9. **Rename / delete** via right-click context menu
 
 ## Project Structure
 
