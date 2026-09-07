@@ -36,7 +36,18 @@ try:
 except ImportError:
     MULTIMEDIA_AVAILABLE = False
 
-from mtp_client import MTPDevice, HANDLE_ROOT, MTPCancelled, is_disconnect_error
+from mtp_client import (MTPDevice, HANDLE_ROOT, MTPCancelled, is_disconnect_error,
+                        restore_macos_ptp_agents)
+
+
+def _resource_dir() -> Path:
+    """Where bundled data lives — the project folder, or the .app bundle."""
+    try:
+        from bundle_support import resource_dir
+        return resource_dir()
+    except ImportError:
+        return Path(__file__).resolve().parent
+
 
 
 # ---------------------------------------------------------------------------
@@ -1620,6 +1631,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("File Manager — Mac ↔ Phone")
         self.setMinimumSize(1050, 680)
         self.worker = None
+        # Auto-connect backoff state (see _auto_detect)
+        self._connect_failures = 0
+        self._skip_ticks = 0
         self._build_ui()
 
         # Start Mac pane at Desktop
@@ -1729,6 +1743,10 @@ class MainWindow(QMainWindow):
     def _try_connect(self, show_errors: bool = False):
         if mtp.is_connected():
             return
+        if show_errors:
+            # Explicit click by the user — retry now, ignore any backoff.
+            self._connect_failures = 0
+            self._skip_ticks = 0
         # Always wipe stale USB state before trying to connect
         mtp.disconnect()
         devices = mtp.find_mtp_devices()
@@ -1743,18 +1761,34 @@ class MainWindow(QMainWindow):
         d = devices[0]
         ok, msg = mtp.connect(vendor_id=d['vendor_id'], product_id=d['product_id'])
         if ok:
+            self._connect_failures = 0
             name = d['name'] or 'Phone'
             self.phone_status_lbl.setText("✓ Connected")
             self.phone_status_lbl.setStyleSheet("color: #007a1f; font-size: 12px; font-weight: bold;")
             self.phone_name_lbl.setText(name)
-            self.status.showMessage(f"Connected: {name}")
+            freed = list(getattr(mtp, 'last_holders_freed', []))
+            booted = list(getattr(mtp, 'last_agents_booted_out', []))
+            if booted:
+                self.status.showMessage(
+                    f"Connected: {name}   (paused macOS camera helpers to free the "
+                    "USB interface — restored when you quit this app)")
+            elif freed:
+                self.status.showMessage(
+                    f"Connected: {name}   (had to quit {', '.join(freed)} to free the USB interface)")
+            else:
+                self.status.showMessage(f"Connected: {name}")
             self.phone_pane._go_phone_root()
         else:
+            self._connect_failures += 1
             if show_errors:
                 QMessageBox.critical(self, "Connection Failed",
-                    f"{msg}\n\nMake sure:\n"
-                    "• The phone is in 'File Transfer' / 'MTP' mode (not Charging)\n"
-                    "• Try unplugging and replugging, then click Connect again")
+                    f"{msg}\n\n"
+                    "Also check the phone is in 'File Transfer' / 'MTP' mode "
+                    "(not 'Charging only').\n\n"
+                    "For a full report, run in Terminal:\n"
+                    "    cd ~/Desktop/Android && .venv/bin/python usb_doctor.py")
+            else:
+                self.status.showMessage(msg.splitlines()[0])
             self._set_disconnected()
 
     def _disconnect(self):
@@ -1780,15 +1814,27 @@ class MainWindow(QMainWindow):
 
     def _auto_detect(self):
         if mtp.is_connected():
+            self._connect_failures = 0
             # Probe that the USB device is still physically present
             if not mtp.ping():
                 self._handle_disconnection()
-        else:
-            devices = mtp.find_mtp_devices()
-            if devices:
-                self._try_connect(show_errors=False)
-            else:
-                self._set_disconnected()
+            return
+
+        devices = mtp.find_mtp_devices()
+        if not devices:
+            self._connect_failures = 0
+            self._set_disconnected()
+            return
+
+        # A phone is plugged in but we could not take it. Back off instead of
+        # retrying (and re-killing macOS's PTP helpers) every 5 seconds:
+        # 1 tick, then 2, 4, 8, capped at 12 (~1 minute between attempts).
+        if self._connect_failures:
+            self._skip_ticks -= 1
+            if self._skip_ticks > 0:
+                return
+            self._skip_ticks = min(2 ** self._connect_failures, 12)
+        self._try_connect(show_errors=False)
 
     def _show_help(self):
         QMessageBox.information(self, "How to Connect",
@@ -1937,6 +1983,16 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         if _preview_cache_dir is not None:
             shutil.rmtree(_preview_cache_dir, ignore_errors=True)
+        # Release the phone and put back any macOS PTP agent we booted out to
+        # get at it, so Image Capture / Photos work normally again afterwards.
+        try:
+            mtp.disconnect()
+        except Exception:
+            pass
+        try:
+            restore_macos_ptp_agents()
+        except Exception:
+            pass
         super().closeEvent(event)
 
 
@@ -1950,6 +2006,14 @@ def main():
         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # Name and icon for the Dock / menu bar. Matters when launched from the
+    # .app bundle, where the process is otherwise just "python".
+    app.setApplicationName("Android File Manager")
+    app.setApplicationDisplayName("Android File Manager")
+    icon_path = _resource_dir() / "assets" / "icon.png"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     palette = app.palette()
     palette.setColor(QPalette.ColorRole.Window,          QColor(246, 246, 246))

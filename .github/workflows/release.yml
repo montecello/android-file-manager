@@ -1,0 +1,111 @@
+name: Build and publish the Mac app
+
+# Publishing a new version is one command:
+#
+#     git tag v1.1.0 && git push origin v1.1.0
+#
+# That builds the app on a real Apple Silicon Mac and a real Intel Mac,
+# and attaches both DMGs to a GitHub release people can download.
+#
+# "Run workflow" in the Actions tab builds the DMGs without releasing them,
+# which is the way to check a change before tagging it.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14      # Apple Silicon (M1 and later)
+            arch: arm64
+          - runner: macos-13      # Intel
+            arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install libusb
+        run: brew install libusb
+
+      - name: Work out the version
+        id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(cat VERSION)+dev"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION for ${{ matrix.arch }}"
+
+      - name: Build the DMG
+        run: ./packaging/build_dmg.sh "${{ steps.v.outputs.version }}"
+
+      - name: Check the bundle carries its own libusb
+        run: |
+          find "dist/Android File Manager.app" -name 'libusb-1.0*.dylib' -print | grep -q . \
+            || { echo "libusb missing from the bundle"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.dmg
+          generate_release_notes: true
+          body: |
+            ## Download
+
+            | Your Mac | File |
+            |---|---|
+            | Apple Silicon (M1, M2, M3, M4) | `AndroidFileManager-*-arm64.dmg` |
+            | Intel | `AndroidFileManager-*-x86_64.dmg` |
+
+            Not sure which you have? Apple menu > About This Mac. A "Chip"
+            line means Apple Silicon; a "Processor" line means Intel.
+
+            ### Installing
+
+            Open the DMG, drag the app to Applications, and launch it.
+
+            The first launch is blocked, because this app is not signed with
+            a paid Apple developer certificate. Open **System Settings >
+            Privacy & Security**, scroll to the message about Android File
+            Manager, and click **Open Anyway**. Once only.
+
+            ### Using it
+
+            Plug in the phone, choose **File Transfer / MTP** on the phone
+            (not "Charging only"), then click **Connect Phone**.

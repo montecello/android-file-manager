@@ -2,11 +2,23 @@
 Pure-Python MTP (Media Transfer Protocol) client using pyusb + libusb.
 Works with basic/feature phones that present an MTP interface (Class 6, Sub 1, Proto 1).
 """
+import atexit
 import struct
 import os
+import sys
 import logging
+import subprocess
 import threading
+import time
 from typing import Optional, List, Tuple, Dict
+
+# Must come before `usb.core`: points ctypes at the libusb carried inside
+# the .app bundle. A no-op in a source checkout, where the system search
+# already finds Homebrew's copy.
+try:
+    import bundle_support  # noqa: F401
+except ImportError:
+    pass
 
 try:
     import usb.core
@@ -16,6 +28,20 @@ except ImportError:
     PYUSB_AVAILABLE = False
 
 log = logging.getLogger('mtp')
+
+IS_MACOS = sys.platform == 'darwin'
+
+# macOS auto-launches these helpers whenever a USB device exposing a Still
+# Image / PTP interface (class 6) is attached — which is exactly what an MTP
+# phone looks like. They open the interface exclusively, so libusb's
+# claim_interface then fails with LIBUSB_ERROR_ACCESS ("Errno 13 Access
+# denied"). They are user-level, on-demand agents: killing them is harmless
+# and macOS relaunches them the next time something actually needs them.
+MACOS_PTP_HOLDERS = (
+    'ptpcamerad',
+    'PTPCamera',
+    'Image Capture Extension',
+)
 
 # ---------------------------------------------------------------------------
 # MTP Operation Codes
@@ -102,6 +128,440 @@ def is_disconnect_error(exc) -> bool:
         'No such device', 'LIBUSB_ERROR_NO_DEVICE', 'Errno 19', 'disconnected'))
 
 
+def is_access_error(exc) -> bool:
+    """
+    True if an exception means "something else already owns this interface".
+
+    On macOS this is what you get when ptpcamerad / Image Capture / another
+    copy of this app holds the MTP interface: libusb reports
+    LIBUSB_ERROR_ACCESS, which pyusb surfaces as errno 13.
+    """
+    if PYUSB_AVAILABLE and isinstance(exc, usb.core.USBError):
+        if exc.errno == 13:  # EACCES
+            return True
+        if getattr(exc, 'backend_error_code', None) == -3:  # LIBUSB_ERROR_ACCESS
+            return True
+    msg = str(exc)
+    return any(m in msg for m in (
+        'LIBUSB_ERROR_ACCESS', 'Access denied', 'Errno 13',
+        'insufficient permissions', 'Resource busy', 'LIBUSB_ERROR_BUSY'))
+
+
+#  Darwin stores a process's accounting name in p_comm, capped at MAXCOMLEN
+#  (16) characters — which is what pgrep -x / pkill -x compare against. So
+#  "Image Capture Extension" has to be matched as "Image Capture Ex".
+MAXCOMLEN = 16
+
+
+def _comm_name(name: str) -> str:
+    return name[:MAXCOMLEN]
+
+
+def _process_is_running(name: str) -> bool:
+    """True if a process with this (accounting) name is running."""
+    try:
+        res = subprocess.run(['pgrep', '-x', _comm_name(name)],
+                             capture_output=True, text=True, timeout=3)
+    except Exception:
+        return False
+    if res.returncode != 0:
+        return False
+    me = os.getpid()
+    return any(p.isdigit() and int(p) != me for p in res.stdout.split())
+
+
+def _interface_is_mtp(intf) -> Tuple[bool, str]:
+    """
+    Does this USB interface speak MTP?
+
+    Two shapes in the wild: the PTP/MTP still-image class (6/1/1), and the
+    vendor-specific interface Android uses, which is only identifiable by its
+    interface string being "MTP".
+    """
+    try:
+        name = (usb.util.get_string(intf.device, intf.iInterface) or '').strip()
+    except Exception:
+        name = ''
+    if intf.bInterfaceClass == 6 and intf.bInterfaceSubClass == 1:
+        # 6/1/1 covers both MTP and plain PTP; the interface string is the
+        # only hint about which the phone thinks it is offering, and macOS
+        # fights much harder for something it reads as a camera.
+        kind = f"still-image class 6/1/{intf.bInterfaceProtocol}"
+        if name:
+            kind += f", iInterface='{name}'"
+        return True, kind
+    if intf.bInterfaceClass == 0xFF and name.upper() == 'MTP':
+        return True, "vendor-specific, iInterface='MTP'"
+    return False, ''
+
+
+def _mtp_interfaces(dev) -> List[Dict]:
+    """
+    Every interface on this device that could carry MTP, best candidate first.
+
+    Each entry has intf_num, ep_in, ep_out and a human-readable `kind`. Only
+    interfaces with both a bulk IN and a bulk OUT endpoint qualify — an MTP
+    interface without them cannot work.
+    """
+    out = []
+    try:
+        cfgs = list(dev)
+    except Exception:
+        return out
+    for cfg in cfgs:
+        for intf in cfg:
+            is_mtp, kind = _interface_is_mtp(intf)
+            if not is_mtp:
+                continue
+            ep_in = ep_out = None
+            for ep in intf:
+                if usb.util.endpoint_type(ep.bmAttributes) != usb.util.ENDPOINT_TYPE_BULK:
+                    continue
+                if usb.util.endpoint_direction(ep.bEndpointAddress) == usb.util.ENDPOINT_IN:
+                    ep_in = ep_in or ep.bEndpointAddress
+                else:
+                    ep_out = ep_out or ep.bEndpointAddress
+            if ep_in is None or ep_out is None:
+                continue
+            out.append({
+                'intf_num': intf.bInterfaceNumber,
+                'ep_in': ep_in,
+                'ep_out': ep_out,
+                'kind': kind,
+                'config': getattr(cfg, 'bConfigurationValue', 1),
+            })
+    return out
+
+
+def macos_usb_interface_clients(vendor_id: Optional[int] = None,
+                                product_id: Optional[int] = None) -> List[str]:
+    """
+    Ask IOKit which processes have this device's USB interfaces open.
+
+    `ioreg` records the opener of every IOUSBHostInterface as
+    `IOUserClientCreator = "pid 483, ptpcamerad"`. That is ground truth about
+    who holds the interface — but every keyboard, trackpad, webcam and hub on
+    the machine has one too, so without a vendor/product filter the list is
+    noise. Pass the phone's ids to get only what is holding *the phone*.
+    Returns entries like "ptpcamerad (pid 483)".
+    """
+    if not IS_MACOS:
+        return []
+    try:
+        # -r roots the output at each USB device, so an interface's
+        # IOUserClientCreator lands inside its own device's block.
+        res = subprocess.run(['ioreg', '-w0', '-r', '-l', '-c', 'IOUSBHostDevice'],
+                             capture_output=True, text=True, timeout=10)
+    except Exception:
+        return []
+
+    want = None if vendor_id is None or product_id is None else (vendor_id, product_id)
+    blocks: List[Dict] = []
+    cur: Optional[Dict] = None
+    for line in res.stdout.splitlines():
+        if '<class IOUSBHostDevice' in line:
+            cur = {'vid': None, 'pid': None, 'clients': []}
+            blocks.append(cur)
+            continue
+        if cur is None:
+            continue
+        stripped = line.strip()
+        if stripped.startswith('"idVendor"') and cur['vid'] is None:
+            cur['vid'] = _int_after_equals(stripped)
+        elif stripped.startswith('"idProduct"') and cur['pid'] is None:
+            cur['pid'] = _int_after_equals(stripped)
+        elif 'IOUserClientCreator' in stripped:
+            _, _, value = stripped.partition('=')
+            value = value.strip().strip('"')
+            pid, _, name = value.partition(',')          # "pid 483, ptpcamerad"
+            name = name.strip() or value
+            pid = pid.replace('pid', '').strip()
+            entry = f"{name} (pid {pid})" if pid.isdigit() else name
+            if name and entry not in cur['clients']:
+                cur['clients'].append(entry)
+
+    clients: List[str] = []
+    for b in blocks:
+        if want is not None and (b['vid'], b['pid']) != want:
+            continue
+        for c in b['clients']:
+            if c not in clients:
+                clients.append(c)
+    return clients
+
+
+def _int_after_equals(line: str) -> Optional[int]:
+    _, _, value = line.partition('=')
+    value = value.strip()
+    try:
+        return int(value, 16) if value.lower().startswith('0x') else int(value)
+    except ValueError:
+        return None
+
+
+def macos_ptp_holders_running() -> List[str]:
+    """Names of the macOS PTP helper daemons currently running."""
+    if not IS_MACOS:
+        return []
+    return [n for n in MACOS_PTP_HOLDERS if _process_is_running(n)]
+
+
+def free_macos_ptp_holders() -> List[str]:
+    """
+    Ask macOS's PTP helpers to let go of the phone.
+
+    Returns the names actually killed. No sudo required — these run as the
+    logged-in user. macOS restarts them on demand, so this only ever borrows
+    the device for the lifetime of our session.
+    """
+    if not IS_MACOS:
+        return []
+    killed = []
+    for name in MACOS_PTP_HOLDERS:
+        if not _process_is_running(name):
+            continue
+        try:
+            # pkill -x matches the same truncated name pgrep -x just found,
+            # so detection and termination can never disagree.
+            subprocess.run(['pkill', '-x', _comm_name(name)],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL,
+                           timeout=5)
+            killed.append(name)
+        except Exception:
+            pass
+    if killed:
+        log.info("Released macOS PTP helper(s): %s", ', '.join(killed))
+        # Deliberately no sleep here. launchd relaunches ptpcamerad within a
+        # fraction of a second and the new process immediately re-opens the
+        # interface, so any pause we take hands the device straight back. The
+        # caller retries the claim in a tight loop instead.
+    return killed
+
+
+# Labels to try if we cannot work the real one out from the running process.
+LAUNCHD_PTP_AGENTS = (
+    'com.apple.ptpcamerad',
+    'com.apple.imagecaptureextension2',
+)
+LAUNCHD_AGENT_PLISTS = '/System/Library/LaunchAgents'
+
+# Why the last bootout attempt failed, for the error message.
+last_bootout_error: str = ''
+# Set once launchd tells us SIP forbids booting these jobs out. There is no
+# point paying a second of latency on every connect to be told that again.
+sip_blocks_bootout: bool = False
+
+
+def _gui_domain() -> str:
+    return f'gui/{os.getuid()}'
+
+
+def _launchctl(*args) -> Tuple[bool, str]:
+    try:
+        res = subprocess.run(['launchctl', *args],
+                             capture_output=True, text=True, timeout=10)
+        return res.returncode == 0, (res.stderr or res.stdout).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def _pids_of(name: str) -> List[int]:
+    try:
+        res = subprocess.run(['pgrep', '-x', _comm_name(name)],
+                             capture_output=True, text=True, timeout=3)
+    except Exception:
+        return []
+    me = os.getpid()
+    return [int(p) for p in res.stdout.split() if p.isdigit() and int(p) != me]
+
+
+def launchd_jobs() -> List[Tuple[Optional[int], str]]:
+    """
+    (pid, label) for every job in this user's launchd domain.
+
+    `launchctl list` prints "PID<TAB>Status<TAB>Label"; a dash in the PID
+    column means the job is loaded but not currently running.
+    """
+    ok, out = _launchctl('list')
+    if not ok:
+        return []
+    jobs = []
+    for line in out.splitlines()[1:]:
+        parts = line.split('\t')
+        if len(parts) < 3:
+            continue
+        pid = int(parts[0]) if parts[0].strip().isdigit() else None
+        jobs.append((pid, parts[2].strip()))
+    return jobs
+
+
+def launchd_labels_for_ptp() -> List[str]:
+    """
+    Work out which launchd jobs own the PTP helpers.
+
+    Guessing the label was the flaw in the first attempt — on some macOS
+    versions ptpcamerad is not `com.apple.ptpcamerad` in the gui domain at
+    all. So: match the *running* helper's pid against launchctl's job list,
+    and only fall back to the well-known names if that finds nothing.
+    """
+    if not IS_MACOS:
+        return []
+    live_pids = set()
+    for name in MACOS_PTP_HOLDERS:
+        live_pids.update(_pids_of(name))
+
+    labels, jobs = [], launchd_jobs()
+    for pid, label in jobs:
+        if pid is not None and pid in live_pids and label not in labels:
+            labels.append(label)
+    # Also anything that looks like a PTP/Image-Capture job, running or not.
+    for _pid, label in jobs:
+        low = label.lower()
+        if ('ptpcamera' in low or 'imagecaptureextension' in low) and label not in labels:
+            labels.append(label)
+    for label in LAUNCHD_PTP_AGENTS:
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _domains_for(label: str) -> List[str]:
+    return [f'{_gui_domain()}/{label}', f'system/{label}']
+
+
+def launchd_agent_loaded(label: str) -> bool:
+    return any(_launchctl('print', d)[0] for d in _domains_for(label))
+
+
+def _plist_path_for(label: str) -> str:
+    """Ask launchd where the job's plist lives, so we can bootstrap it back."""
+    for d in _domains_for(label):
+        ok, out = _launchctl('print', d)
+        if not ok:
+            continue
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith('path = ') and line.endswith('.plist'):
+                return line[len('path = '):].strip()
+    return f'{LAUNCHD_AGENT_PLISTS}/{label}.plist'
+
+
+# Agents this process booted out: label -> (domain, plist path).
+_BOOTED_OUT: Dict[str, Tuple[str, str]] = {}
+
+
+def bootout_macos_ptp_agents() -> List[str]:
+    """
+    Stop launchd from respawning the PTP helpers, for this login session.
+
+    Returns the labels actually booted out. They are restored automatically
+    when this process exits (see restore_macos_ptp_agents), and logging out
+    and back in restores them regardless.
+    """
+    global last_bootout_error, sip_blocks_bootout
+    if not IS_MACOS or sip_blocks_bootout:
+        return []
+    out, errors = [], []
+    for label in launchd_labels_for_ptp():
+        plist = _plist_path_for(label)
+        for domain in _domains_for(label):
+            ok, err = _launchctl('print', domain)
+            if not ok:
+                continue  # job is not in this domain
+            ok, err = _launchctl('bootout', domain)
+            if ok:
+                out.append(label)
+                _BOOTED_OUT[label] = (domain.rsplit('/', 1)[0], plist)
+                log.info("Booted out launchd job %s", domain)
+            else:
+                errors.append(f"{domain}: {err or 'failed'}")
+                log.info("Could not boot out %s: %s", domain, err)
+                if 'System Integrity Protection' in err or ': 150:' in err:
+                    sip_blocks_bootout = True
+            break
+    last_bootout_error = '; '.join(errors)
+    return out
+
+
+class _HelperStorm:
+    """
+    Keep killing macOS's PTP helper for as long as we are trying to claim.
+
+    When SIP forbids booting the launchd job out, the helper cannot be stopped
+    — killed, it is respawned and re-opens the interface within milliseconds.
+    A single kill therefore just loses the race. Killing it continuously from
+    a background thread keeps knocking the newcomer over while the main thread
+    hammers claim_interface(), so we only have to win one of many attempts.
+
+    Used as a context manager; the storm always stops when the block exits.
+    """
+
+    def __init__(self, interval: float = 0.03):
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.kills = 0
+
+    def _run(self):
+        import signal
+        while not self._stop.is_set():
+            for name in MACOS_PTP_HOLDERS:
+                for pid in _pids_of(name):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        self.kills += 1
+                    except Exception:
+                        pass
+            self._stop.wait(self.interval)
+
+    def __enter__(self):
+        if IS_MACOS:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self.kills:
+            log.info("Kill-storm knocked the PTP helper over %d time(s)", self.kills)
+        return False
+
+
+def restore_macos_ptp_agents(labels: Optional[List[str]] = None) -> List[str]:
+    """
+    Put back agents booted out by bootout_macos_ptp_agents().
+
+    Only touches agents this process actually booted out, so it can never
+    "restore" something the user disabled deliberately.
+    """
+    if not IS_MACOS:
+        return []
+    if labels is None:
+        targets = list(_BOOTED_OUT.items())
+    else:
+        targets = [(l, _BOOTED_OUT.get(l, (_gui_domain(), _plist_path_for(l))))
+                   for l in labels]
+    restored = []
+    for label, (domain, plist) in targets:
+        if not launchd_agent_loaded(label):
+            ok, err = _launchctl('bootstrap', domain, plist)
+            if not ok:
+                log.info("Could not restore %s: %s", label, err)
+                continue
+        restored.append(label)
+        _BOOTED_OUT.pop(label, None)
+    if restored:
+        log.info("Restored launchd job(s): %s", ', '.join(restored))
+    return restored
+
+
+if IS_MACOS:
+    atexit.register(restore_macos_ptp_agents)
+
+
 class MTPDevice:
     def __init__(self):
         self.dev = None
@@ -112,6 +572,17 @@ class MTPDevice:
         self._session_id = 1
         self._session_open = False
         self._storage_ids: Optional[List[int]] = None
+        self._claimed = False
+        self._name_cache: Dict[Tuple[int, int], str] = {}
+        self._mtp_cache: Dict[Tuple[int, int], bool] = {}
+        # Names of macOS helpers we killed to get the interface, for the log.
+        self.last_holders_freed: List[str] = []
+        # launchd agents we booted out; restored when the app quits.
+        self.last_agents_booted_out: List[str] = []
+        # Ids of the device we last tried to connect to, for diagnostics.
+        self._last_vid: Optional[int] = None
+        self._last_pid: Optional[int] = None
+        self._last_intf_kind: str = ''
         # Serializes all USB/MTP transactions. The GUI issues directory
         # listings and file transfers from separate QThreads; without this
         # lock their command/response containers would interleave on the
@@ -124,33 +595,68 @@ class MTPDevice:
     # ------------------------------------------------------------------
 
     def find_mtp_devices(self) -> List[Dict]:
-        """Return list of dicts describing connected MTP devices."""
+        """
+        Return list of dicts describing connected MTP devices.
+
+        Called on a 5s timer by the GUI, so it is careful to (a) report each
+        physical device only once even when several configs/interfaces match,
+        (b) read the string descriptors only the first time a given VID:PID is
+        seen — each read opens the device, and hammering the phone with opens
+        every few seconds is itself a way to provoke a busy/access error — and
+        (c) dispose every handle it opened before returning.
+        """
         if not PYUSB_AVAILABLE:
             return []
         results = []
+        seen = set()
         try:
             devs = list(usb.core.find(find_all=True))
         except Exception:
             return []
         for d in devs:
             try:
-                for cfg in d:
-                    for intf in cfg:
-                        if intf.bInterfaceClass == 6 and intf.bInterfaceSubClass == 1:
-                            try:
-                                mfr = usb.util.get_string(d, d.iManufacturer) if d.iManufacturer else ''
-                                prod = usb.util.get_string(d, d.iProduct) if d.iProduct else ''
-                            except Exception:
-                                mfr, prod = '', ''
-                            name = f"{mfr} {prod}".strip() or f"Device {hex(d.idVendor)}:{hex(d.idProduct)}"
-                            results.append({
-                                'name': name,
-                                'vendor_id': d.idVendor,
-                                'product_id': d.idProduct,
-                                'serial': d.iSerialNumber,
-                            })
+                cache_key = (d.idVendor, d.idProduct)
+                is_mtp = self._mtp_cache.get(cache_key)
+                if is_mtp is None:
+                    # Probed once per VID:PID per run — identifying a
+                    # vendor-specific MTP interface needs a string descriptor
+                    # read, which opens the device, and doing that on every
+                    # 5s poll is exactly what we are trying to avoid.
+                    is_mtp = bool(_mtp_interfaces(d))
+                    self._mtp_cache[cache_key] = is_mtp
+                if not is_mtp:
+                    continue
+                key = (d.idVendor, d.idProduct, getattr(d, 'address', None))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                name = self._name_cache.get(cache_key)
+                if name is None:
+                    try:
+                        mfr = usb.util.get_string(d, d.iManufacturer) if d.iManufacturer else ''
+                        prod = usb.util.get_string(d, d.iProduct) if d.iProduct else ''
+                    except Exception:
+                        mfr, prod = '', ''
+                    name = f"{mfr} {prod}".strip() or f"Device {hex(d.idVendor)}:{hex(d.idProduct)}"
+                    self._name_cache[cache_key] = name
+
+                results.append({
+                    'name': name,
+                    'vendor_id': d.idVendor,
+                    'product_id': d.idProduct,
+                    'serial': d.iSerialNumber,
+                })
             except Exception:
                 pass
+            finally:
+                # Never leave a handle open on a device we are about to claim.
+                # These are throwaway Device objects; disposing them does not
+                # touch the handle held by an active connection.
+                try:
+                    usb.util.dispose_resources(d)
+                except Exception:
+                    pass
         return results
 
     def connect(self, vendor_id: int = None, product_id: int = None) -> Tuple[bool, str]:
@@ -169,6 +675,7 @@ class MTPDevice:
             kwargs['idProduct'] = product_id
 
         self.dev = None
+        interfaces: List[Dict] = []
         try:
             if kwargs:
                 candidates = [usb.core.find(**kwargs)]
@@ -178,30 +685,18 @@ class MTPDevice:
             for d in candidates:
                 if d is None:
                     continue
-                for cfg in d:
-                    for intf in cfg:
-                        if intf.bInterfaceClass == 6 and intf.bInterfaceSubClass == 1:
-                            self.dev = d
-                            self.intf_num = intf.bInterfaceNumber
-                            # Find endpoints
-                            for ep in intf:
-                                direction = usb.util.endpoint_direction(ep.bEndpointAddress)
-                                ep_type = usb.util.endpoint_type(ep.bmAttributes)
-                                if ep_type == usb.util.ENDPOINT_TYPE_BULK:
-                                    if direction == usb.util.ENDPOINT_IN:
-                                        self.ep_in = ep.bEndpointAddress
-                                    else:
-                                        self.ep_out = ep.bEndpointAddress
-                            break
-                    if self.dev:
-                        break
-                if self.dev:
+                interfaces = _mtp_interfaces(d)
+                if interfaces:
+                    self.dev = d
                     break
         except Exception as e:
             return False, f"USB error: {e}"
 
         if not self.dev:
             return False, "No MTP device found. Connect phone and set USB mode to 'File Transfer'."
+
+        vid, pid = self.dev.idVendor, self.dev.idProduct
+        self._last_vid, self._last_pid = vid, pid
 
         # Fully release any previous claim on this device
         try:
@@ -215,31 +710,31 @@ class MTPDevice:
 
         # Re-acquire the device object freshly
         try:
-            self.dev = usb.core.find(idVendor=self.dev.idVendor,
-                                     idProduct=self.dev.idProduct)
+            self.dev = usb.core.find(idVendor=vid, idProduct=pid)
         except Exception:
             pass
         if self.dev is None:
             return False, "Device disappeared after reconnect attempt."
 
-        # Detach kernel driver if needed (Linux only; silently skipped on macOS)
-        try:
-            if self.dev.is_kernel_driver_active(self.intf_num):
-                self.dev.detach_kernel_driver(self.intf_num)
-        except Exception:
-            pass
-
-        # Claim interface
-        claimed = False
-        try:
-            usb.util.claim_interface(self.dev, self.intf_num)
-            claimed = True
-        except Exception as e:
-            return False, (f"Cannot claim USB interface: {e}\n\n"
-                           "Try:\n"
-                           "• Close Image Capture / Photos if open\n"
-                           "• Unplug and replug the phone\n"
-                           "• Run the app with sudo")
+        # Claim the interface, evicting whatever else is holding it. Phones can
+        # expose more than one MTP-looking interface (extra configurations, or
+        # a vendor-specific "MTP" interface alongside the class-6 one) and only
+        # some of them are actually usable, so try each in turn.
+        err = ''
+        for i, cand in enumerate(interfaces):
+            self.intf_num = cand['intf_num']
+            self.ep_in = cand['ep_in']
+            self.ep_out = cand['ep_out']
+            self._last_intf_kind = cand['kind']
+            log.debug("Trying interface %d (%s)", cand['intf_num'], cand['kind'])
+            ok, err = self._claim_interface(vid, pid)
+            if ok:
+                break
+            if i + 1 < len(interfaces):
+                log.info("Interface %d unavailable (%s) — trying the next one",
+                         cand['intf_num'], err.splitlines()[0] if err else '?')
+        else:
+            return False, err
 
         # Flush any stale data in the device's output buffer
         self._flush_stale_data()
@@ -256,12 +751,242 @@ class MTPDevice:
                       self.intf_num, self.ep_in, self.ep_out)
             return True, "Connected"
         except Exception as e:
-            # Clean up on failure
+            # Clean up on failure — leaving the interface claimed here is what
+            # makes the *next* connect attempt fail with "access denied".
+            self._release_handle()
+            return False, f"Could not open MTP session: {e}"
+
+    # ------------------------------------------------------------------
+
+    def _ensure_configured(self):
+        """
+        Make sure the device has an active configuration.
+
+        Normally the OS has already configured it. Only set it ourselves when
+        it genuinely has none — calling set_configuration() on an already
+        configured device resets it and would break a working connection.
+        """
+        try:
+            if self.dev.get_active_configuration() is not None:
+                return
+        except Exception:
+            pass
+        try:
+            self.dev.set_configuration()
+            time.sleep(0.2)
+        except Exception as e:
+            log.debug("set_configuration failed (usually harmless): %s", e)
+
+    def _refresh_handle(self, vid: int, pid: int) -> bool:
+        """Drop the current libusb handle and open a fresh one."""
+        try:
+            usb.util.dispose_resources(self.dev)
+        except Exception:
+            pass
+        try:
+            self.dev = usb.core.find(idVendor=vid, idProduct=pid)
+        except Exception:
+            self.dev = None
+        return self.dev is not None
+
+    def _claim_burst(self, vid: int, pid: int,
+                     seconds: float) -> Tuple[bool, Optional[Exception]]:
+        """
+        Hammer claim_interface() until it succeeds or the deadline passes.
+
+        Timing matters more than patience here. After ptpcamerad is killed,
+        launchd relaunches it within a few hundred milliseconds and the new
+        process re-opens the interface, so the window we can claim in is short
+        and it opens *immediately*. Polling hard for a couple of seconds beats
+        sleeping and trying once.
+        """
+        deadline = time.monotonic() + max(seconds, 0.0)
+        last_err: Optional[Exception] = None
+        tries = 0
+        while True:
+            if self.dev is None and not self._refresh_handle(vid, pid):
+                return False, last_err
             try:
-                usb.util.release_interface(self.dev, self.intf_num)
+                usb.util.claim_interface(self.dev, self.intf_num)
+                self._claimed = True
+                if tries:
+                    log.info("Claimed MTP interface after %d tries", tries + 1)
+                return True, None
+            except Exception as e:
+                last_err = e
+                tries += 1
+                if not is_access_error(e):
+                    return False, e  # not contention; retrying cannot help
+            if time.monotonic() >= deadline:
+                return False, last_err
+            # A stale handle can keep failing after the interface is free, so
+            # take a new one every so often while we keep trying.
+            if tries % 10 == 0:
+                self._refresh_handle(vid, pid)
+            time.sleep(0.04)
+
+    def _claim_interface(self, vid: int, pid: int) -> Tuple[bool, str]:
+        """
+        Claim the MTP interface, evicting whatever else is holding it.
+
+        The macOS failure is not a permissions problem despite what the message
+        says: a class-6 (Still Image / PTP) interface makes macOS spin up
+        ptpcamerad / Image Capture Extension, which open the interface
+        exclusively. libusb then reports LIBUSB_ERROR_ACCESS -> "[Errno 13]
+        Access denied".
+
+        Escalation ladder, gentlest first:
+          1. just claim it
+          2. kill the helpers and race launchd's respawn for the interface
+          3. boot the helpers' launchd agents out so nothing respawns, retry
+          4. capture the device from the kernel driver (only works as root)
+        """
+        self._claimed = False
+        self.last_holders_freed = []
+        self.last_agents_booted_out = []
+
+        if self.dev is None and not self._refresh_handle(vid, pid):
+            return False, "Phone disappeared from the USB bus. Replug the cable and try again."
+        self._ensure_configured()
+
+        # 1. The easy case: nothing else wants it.
+        ok, err = self._claim_burst(vid, pid, 0.0)
+        if ok:
+            return True, ""
+        if not is_access_error(err):
+            return False, self._claim_error_message(err)
+
+        if not IS_MACOS:
+            # Linux/BSD: hand the interface back from its kernel driver.
+            try:
+                if self.dev is not None and self.dev.is_kernel_driver_active(self.intf_num):
+                    self.dev.detach_kernel_driver(self.intf_num)
             except Exception:
                 pass
-            return False, f"Could not open MTP session: {e}"
+            ok, err = self._claim_burst(vid, pid, 1.0)
+            return (True, "") if ok else (False, self._claim_error_message(err))
+
+        # 2. Running as root, we can take the device away from the kernel
+        #    outright. That is deterministic, so try it before the races.
+        if os.getuid() == 0:
+            try:
+                if self.dev is not None:
+                    self.dev.detach_kernel_driver(self.intf_num)
+                    log.info("Captured the device from the kernel driver (root)")
+                    ok, err2 = self._claim_burst(vid, pid, 1.0)
+                    if ok:
+                        return True, ""
+                    err = err2 or err
+            except Exception as e:
+                log.debug("detach_kernel_driver unavailable: %s", e)
+
+        # 3. Kill the helper continuously while hammering the claim. With SIP
+        #    engaged this is the only thing that works without root: the helper
+        #    respawns in milliseconds, so one kill loses, but a storm of them
+        #    keeps the newcomer down long enough for one claim to land.
+        with _HelperStorm() as storm:
+            ok, err2 = self._claim_burst(vid, pid, 2.5)
+        if storm.kills:
+            self.last_holders_freed = macos_ptp_holders_running() or ['ptpcamerad']
+        if ok:
+            return True, ""
+        err = err2 or err
+
+        # 4. Take launchd out of the game entirely, if SIP allows it.
+        if is_access_error(err) and not sip_blocks_bootout:
+            booted = bootout_macos_ptp_agents()
+            self.last_agents_booted_out = list(booted)
+            if booted:
+                free_macos_ptp_holders()
+                ok, err2 = self._claim_burst(vid, pid, 2.0)
+                if ok:
+                    log.info("Claimed after booting out %s", ', '.join(booted))
+                    return True, ""
+                err = err2 or err
+
+        # 5. Force a re-enumeration: whoever holds the interface gets an
+        #    invalid handle. Storm the helper through the re-attach, since it
+        #    is relaunched by the device appearing again.
+        if is_access_error(err):
+            try:
+                if self.dev is not None:
+                    self.dev.reset()
+                    log.info("Reset the USB device to break the existing claim")
+                    self.dev = None
+                    with _HelperStorm():
+                        time.sleep(0.3)
+                        ok, err2 = self._claim_burst(vid, pid, 1.5)
+                    if ok:
+                        return True, ""
+                    err = err2 or err
+            except Exception as e:
+                log.debug("device reset unavailable: %s", e)
+
+        return False, self._claim_error_message(err)
+
+    def _claim_error_message(self, err: Optional[Exception]) -> str:
+        lines = [f"Cannot claim USB interface: {err}", ""]
+        if not (IS_MACOS and (err is None or is_access_error(err))):
+            lines.append("Try:")
+            lines.append("• Unplug and replug the phone, then reselect 'File Transfer' mode")
+            lines.append("• Close any other app that talks to the phone over USB")
+            return "\n".join(lines)
+
+        clients = macos_usb_interface_clients(self._last_vid, self._last_pid)
+        # Filter out ourselves — we may hold another interface on the phone.
+        me = f"(pid {os.getpid()})"
+        clients = [c for c in clients if me not in c]
+        is_root = os.getuid() == 0
+
+        if clients:
+            lines.append("Holding this phone's USB interfaces (from IOKit):")
+            for c in clients:
+                lines.append(f"    {c}")
+            lines.append("")
+            lines.append("Quit that app and click Connect again.")
+            lines.append("(Android File Transfer, OpenMTP, MacDroid, Image Capture "
+                         "and Photos all hold on to phones.)")
+            return "\n".join(lines)
+
+        # Nothing is sitting on it, so macOS is re-taking it as fast as it is
+        # freed. Saying "quit your other apps" here would be noise.
+        lines.append("macOS is re-claiming the phone the instant it is freed.")
+        lines.append("")
+        lines.append("Already tried, without success:")
+        lines.append("• killing ptpcamerad continuously while claiming (it is "
+                     "respawned in milliseconds)")
+        if sip_blocks_bootout:
+            lines.append("• disabling its launchd job — blocked by System "
+                         "Integrity Protection")
+        elif self.last_agents_booted_out:
+            lines.append("• stopped launchd respawning "
+                         + ', '.join(self.last_agents_booted_out))
+        elif last_bootout_error:
+            lines.append(f"• disabling its launchd job ({last_bootout_error})")
+        lines.append("• resetting the USB device to break the existing claim")
+        if is_root:
+            lines.append("• capturing the device from the kernel driver as root")
+        lines.append("")
+
+        lines.append("What actually works from here:")
+        if not is_root:
+            lines.append("• Run the app as root — root can take the device away")
+            lines.append("  from macOS's camera stack, which a normal login cannot:")
+            lines.append("      sudo .venv/bin/python android_file_manager.py")
+        if 'PTP' in self._last_intf_kind.upper() or 'CAMERA' in self._last_intf_kind.upper():
+            lines.append(f"• This phone offers the interface as "
+                         f"\"{self._last_intf_kind}\" — macOS treats that as a")
+            lines.append("  camera and fights for it. On the phone, switch USB mode")
+            lines.append("  to 'File Transfer' / 'MTP', not 'PTP' / 'Transfer photos'.")
+        else:
+            lines.append("• On the phone, re-pick 'File Transfer' / 'MTP' in the USB")
+            lines.append("  mode prompt — a mode macOS reads as a camera makes this worse.")
+        lines.append("• Unplug, wait 5 seconds, replug, then click Connect within a")
+        lines.append("  second or two — the interface is free briefly at plug-in.")
+        lines.append("• Run  .venv/bin/python usb_doctor.py  for the full picture")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
 
     def disconnect(self):
         if self._session_open:
@@ -270,19 +995,39 @@ class MTPDevice:
             except Exception:
                 pass
             self._session_open = False
-        if self.dev:
-            try:
-                usb.util.release_interface(self.dev, self.intf_num)
-                usb.util.dispose_resources(self.dev)
-            except Exception:
-                pass
-            self.dev = None
+        self._release_handle()
         self._storage_ids = None
 
-    def _mark_dead(self):
-        """Force-clears connection state without any USB I/O. Safe to call after device removal."""
-        self._session_open = False
+    def _release_handle(self):
+        """
+        Give the interface back and close the libusb handle.
+
+        Dropping the reference alone is not enough: until the handle is
+        released, this process still owns the interface, and the next
+        claim_interface() — even from a brand new handle — comes back as
+        "access denied". Every teardown path must go through here.
+        """
+        dev, intf = self.dev, self.intf_num
         self.dev = None
+        self._claimed = False
+        if dev is None:
+            return
+        try:
+            usb.util.release_interface(dev, intf)
+        except Exception:
+            pass
+        try:
+            usb.util.dispose_resources(dev)
+        except Exception:
+            pass
+
+    def _mark_dead(self):
+        """
+        Clear connection state. Releases our USB handle first (best effort, so
+        it is still safe to call after the device has physically vanished).
+        """
+        self._session_open = False
+        self._release_handle()
         self._storage_ids = None
 
     def ping(self) -> bool:
@@ -291,14 +1036,20 @@ class MTPDevice:
         Does NOT do any MTP-level I/O — just scans the USB bus.
         Returns True if found, False (and marks dead) if gone.
         """
-        if not self._session_open or self.dev is None:
+        dev = self.dev
+        if not self._session_open or dev is None:
             return False
         try:
-            found = usb.core.find(idVendor=self.dev.idVendor,
-                                  idProduct=self.dev.idProduct)
+            found = usb.core.find(idVendor=dev.idVendor, idProduct=dev.idProduct)
             if found is None:
                 self._mark_dead()
                 return False
+            # Throwaway handle from the scan — close it, or the app slowly
+            # accumulates open handles on the phone (once every poll tick).
+            try:
+                usb.util.dispose_resources(found)
+            except Exception:
+                pass
             return True
         except Exception:
             self._mark_dead()

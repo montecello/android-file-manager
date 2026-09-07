@@ -22,3 +22,9 @@ build/
 
 # Logs
 *.log
+
+# Release build
+packaging/.buildvenv/
+dist/
+build/
+*.dmg

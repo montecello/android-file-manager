@@ -1,0 +1,114 @@
+
+[1m==> libusb: /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib[0m
+
+[1m==> Preparing build environment[0m
+build python: 3.15.0a2 arm64
+
+[1m==> Building the app bundle (this takes a minute)[0m
+200 INFO: PyInstaller: 6.22.2, contrib hooks: 2026.7
+201 INFO: Python: 3.15.0a2
+257 INFO: Platform: macOS-26.2-arm64-arm-64bit-Mach-O
+258 INFO: Python environment: /Users/powerfan/Desktop/Android/packaging/.buildvenv
+270 INFO: Removing temporary files and cleaning cache in /Users/powerfan/Library/Application Support/pyinstaller
+276 INFO: Module search paths (PYTHONPATH):
+['/Library/Frameworks/Python.framework/Versions/3.15/lib/python315.zip',
+ '/Library/Frameworks/Python.framework/Versions/3.15/lib/python3.15',
+ '/Library/Frameworks/Python.framework/Versions/3.15/lib/python3.15/lib-dynload',
+ '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages',
+ '/Users/powerfan/Desktop/Android']
+1230 INFO: Appending 'binaries' from .spec
+1231 INFO: Appending 'datas' from .spec
+1232 INFO: checking Analysis
+1232 INFO: Building Analysis because Analysis-00.toc is non existent
+1232 INFO: Looking for Python shared library...
+1270 INFO: Using Python shared library: /Library/Frameworks/Python.framework/Versions/3.15/Python
+1270 INFO: Running Analysis Analysis-00.toc
+1271 INFO: Target bytecode optimization level: 0
+1271 INFO: Initializing module dependency graph...
+1276 INFO: Initializing module graph hook caches...
+1307 INFO: Analyzing modules for base_library.zip ...
+3272 INFO: Processing standard module hook 'hook-math.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+3305 INFO: Processing standard module hook 'hook-heapq.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+4630 INFO: Processing standard module hook 'hook-encodings.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+5178 INFO: Processing standard module hook 'hook-pickle.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+5787 INFO: Processing standard module hook 'hook-difflib.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+10087 INFO: Caching module dependency graph...
+10122 INFO: Analyzing /Users/powerfan/Desktop/Android/android_file_manager.py
+12871 INFO: Processing standard module hook 'hook-PyQt6.QtWidgets.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+16335 INFO: Processing standard module hook 'hook-PyQt6.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+17501 INFO: Processing standard module hook 'hook-PyQt6.QtCore.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+19544 INFO: Processing standard module hook 'hook-PyQt6.QtGui.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+20016 INFO: Processing standard module hook 'hook-PyQt6.QtMultimedia.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+20560 INFO: Processing standard module hook 'hook-PyQt6.QtNetwork.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+23617 INFO: Processing standard module hook 'hook-PyQt6.QtMultimediaWidgets.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+23783 INFO: Processing standard module hook 'hook-sysconfig.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+23798 INFO: Processing standard module hook 'hook-_osx_support.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+23802 INFO: Processing standard module hook 'hook-_ctypes.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+23847 INFO: Processing standard module hook 'hook-usb.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/_pyinstaller_hooks_contrib/stdhooks'
+24298 INFO: Processing standard module hook 'hook-platform.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+24332 INFO: Processing standard module hook 'hook-xml.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+24378 INFO: Processing module hooks (post-graph stage)...
+24426 INFO: Processing standard module hook 'hook-PyQt6.QtDBus.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+24650 INFO: Performing binary vs. data reclassification (154 entries)
+24723 INFO: Looking for ctypes DLLs
+24808 INFO: Analyzing run-time hooks ...
+24812 INFO: Including run-time hook 'pyi_rth_usb.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/_pyinstaller_hooks_contrib/rthooks'
+24818 INFO: Including run-time hook 'pyi_rth_inspect.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks/rthooks'
+24821 INFO: Including run-time hook 'pyi_rth_pyqt6.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks/rthooks'
+24823 INFO: Processing pre-find-module-path hook 'hook-_pyi_rth_utils.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks/pre_find_module_path'
+24825 INFO: Processing standard module hook 'hook-_pyi_rth_utils.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks'
+24828 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from '/Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/hooks/rthooks'
+24837 INFO: Creating base_library.zip...
+24857 INFO: Looking for dynamic libraries
+25460 INFO: Warnings written to /Users/powerfan/Desktop/Android/build/AndroidFileManager/warn-AndroidFileManager.txt
+25478 INFO: Graph cross-reference written to /Users/powerfan/Desktop/Android/build/AndroidFileManager/xref-AndroidFileManager.html
+25768 INFO: checking PYZ
+25768 INFO: Building PYZ because PYZ-00.toc is non existent
+25768 INFO: Building PYZ (ZlibArchive) /Users/powerfan/Desktop/Android/build/AndroidFileManager/PYZ-00.pyz
+26283 INFO: Building PYZ (ZlibArchive) /Users/powerfan/Desktop/Android/build/AndroidFileManager/PYZ-00.pyz completed successfully.
+26290 INFO: EXE target arch: arm64
+26290 INFO: Code signing identity: None
+26296 INFO: checking PKG
+26296 INFO: Building PKG because PKG-00.toc is non existent
+26297 INFO: Building PKG (CArchive) AndroidFileManager.pkg
+26475 INFO: Building PKG (CArchive) AndroidFileManager.pkg completed successfully.
+26477 INFO: Bootloader /Users/powerfan/Desktop/Android/packaging/.buildvenv/lib/python3.15/site-packages/PyInstaller/bootloader/Darwin-64bit/runw
+26477 INFO: checking EXE
+26477 INFO: Building EXE because EXE-00.toc is non existent
+26477 INFO: Building EXE from EXE-00.toc
+26477 INFO: Copying bootloader EXE to /Users/powerfan/Desktop/Android/build/AndroidFileManager/AndroidFileManager
+26479 INFO: Converting EXE to target arch (arm64)
+26534 INFO: Removing signature(s) from EXE
+26580 INFO: Modifying Mach-O image UUID(s) in EXE
+26588 INFO: Appending PKG archive to EXE
+26590 INFO: Fixing EXE headers for code signing
+26622 INFO: Rewriting the executable's macOS SDK version (26.2.0) to match the SDK version of the Python library (26.1.0) in order to avoid inconsistent behavior and potential UI issues in the frozen application.
+26625 INFO: Re-signing the EXE
+26673 INFO: Building EXE from EXE-00.toc completed successfully.
+26680 INFO: checking COLLECT
+26681 INFO: Building COLLECT because COLLECT-00.toc is non existent
+26681 INFO: Building COLLECT COLLECT-00.toc
+40161 INFO: Building COLLECT COLLECT-00.toc completed successfully.
+40181 INFO: checking BUNDLE
+40181 INFO: Building BUNDLE because BUNDLE-00.toc is non existent
+40181 INFO: Building BUNDLE BUNDLE-00.toc
+48531 INFO: Signing the BUNDLE...
+48956 INFO: Building BUNDLE BUNDLE-00.toc completed successfully.
+48969 INFO: Build complete! The results are available in: /Users/powerfan/Desktop/Android/dist
+[spec] bundling libusb from /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib
+
+[1m==> Signing (ad-hoc)[0m
+dist/Android File Manager.app: replacing existing signature
+signature verified
+
+[1m==> Building dist/AndroidFileManager-1.0.0-arm64.dmg[0m
+
+[1m==> Done[0m
+  /Users/powerfan/Desktop/Android/dist/AndroidFileManager-1.0.0-arm64.dmg  ( 44M)
+
+Test it yourself before publishing:
+  open "dist/AndroidFileManager-1.0.0-arm64.dmg"     # drag the app across, then launch it from Applications
+
+Publish it:
+  git tag v1.0.0 && git push origin v1.0.0
+  (GitHub Actions then builds both architectures and creates the release)
