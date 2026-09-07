@@ -27,10 +27,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-14      # Apple Silicon (M1 and later)
+          - runner: macos-14            # Apple Silicon (M1 and later)
             arch: arm64
-          - runner: macos-13      # Intel
-            arch: x86_64
+          - runner: macos-15-intel      # Intel. macos-13 was retired in Dec 2025;
+            arch: x86_64                # this is GitHub's remaining x86_64 image.
+            optional: true              # Intel is a shrinking minority — do not
+                                        # let it block an Apple Silicon release.
+
+    # An Intel runner that is busy or withdrawn must not hold up the release.
+    continue-on-error: ${{ matrix.optional || false }}
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +85,9 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Show what will be published
+        run: ls -la artifacts/
 
       - name: Publish
         uses: softprops/action-gh-release@v2
